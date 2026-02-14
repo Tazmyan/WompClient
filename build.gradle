@@ -1,0 +1,210 @@
+plugins {
+    id 'fabric-loom' version '1.11-SNAPSHOT'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+tasks.withType(Jar).configureEach {
+    archiveBaseName.set(project.archives_base_name)
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    shadowImpl
+    implementation.extendsFrom shadowImpl
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+    it.options.compilerArgs << "-XDstringConcat=inline"
+}
+
+java {
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+// Allatori shit (remove it)
+
+import groovy.xml.XmlSlurper
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+import java.util.zip.ZipOutputStream
+import java.util.zip.ZipEntry
+
+def allatoriJarPath = 'allatori.jar'
+
+tasks.register("allatoriInputJar", Jar) {
+	group = "allatori"
+	description = "Packages compiled classes and resources into build/libs/womp-input.jar for Allatori"
+	dependsOn classes, processResources
+	archiveFileName.set("womp-input.jar")
+	destinationDirectory.set(file("$buildDir/libs"))
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+	from("$buildDir/classes/java/main")
+	from("$buildDir/resources/main")
+}
+
+tasks.register("allatoriCopyDeps") {
+	group = "allatori"
+	description = "Copies runtime classpath jars to build/allatori-deps"
+	doLast {
+		def target = file("$buildDir/allatori-deps")
+		project.delete(target)
+		target.mkdirs()
+		configurations.runtimeClasspath.files.findAll { it.name.endsWith('.jar') }.each { f ->
+			copy {
+				from f
+				into target
+			}
+		}
+		println("Copied ${target.listFiles()?.size() ?: 0} dependency jars to ${target}")
+	}
+}
+
+tasks.register("runAllatori", Exec) {
+	group = "allatori"
+	description = "Runs Allatori obfuscator against womp-input.jar using allatori.xml"
+	dependsOn tasks.named("allatoriInputJar"), tasks.named("allatoriCopyDeps")
+	workingDir project.projectDir
+	environment "JAVA_TOOL_OPTIONS", System.getenv('JAVA_TOOL_OPTIONS') ?: ''
+	commandLine "java", "-jar", allatoriJarPath, "allatori.xml"
+    doFirst {
+		def cfg = file("allatori.xml")
+		if (!cfg.exists()) {
+			throw new GradleException("allatori.xml not found at ${cfg.absolutePath}")
+		}
+		def aj = new File(allatoriJarPath)
+		if (!aj.exists()) {
+			throw new GradleException("Allatori jar not found at ${aj.absolutePath}")
+		}
+		println("Running Allatori: ${aj.absolutePath} allatori.xml")
+	}
+}
+
+tasks.register("updateFabricModJson") {
+    group = "allatori"
+    description = "Parses allatori-log.xml and updates fabric.mod.json entrypoints in the obfuscated jar"
+	dependsOn tasks.named("runAllatori")
+    doLast {
+		def logFile = file("allatori-log.xml")
+		if (!logFile.exists()) {
+			throw new GradleException("allatori-log.xml not found after Allatori run")
+		}
+		String mainClass = null
+		try {
+			def xml = new XmlSlurper(false, false).parse(logFile)
+			def mc1 = xml.'**'.find { it.name() == 'main-class' && it.@name?.text() }
+			if (mc1) mainClass = mc1.@name.text()
+			if (!mainClass) {
+				def mc2 = xml.'**'.find { it.name() == 'property' && it.@name?.text()?.toLowerCase()?.contains('main') && it.@value?.text() }
+				if (mc2) mainClass = mc2.@value.text()
+			}
+			if (!mainClass) {
+				def clsExact = xml.'**'.find { it.name() == 'class' && it.@old?.text() == 'taz.womp.Main' && it.@new?.text() }
+				if (clsExact) mainClass = clsExact.@new.text()
+			}
+			if (!mainClass) {
+				def clsSuffix = xml.'**'.find { it.name() == 'class' && it.@old?.text()?.endsWith('.Main') && it.@new?.text() }
+				if (clsSuffix) mainClass = clsSuffix.@new.text()
+			}
+		} catch (Throwable ignored) {
+		}
+		if (!mainClass) {
+			def m = (logFile.text =~ /<class\s+old=\"([a-zA-Z0-9_.$]+)\"\s+new=\"([a-zA-Z0-9_.$]+)\"/)
+			if (m.find()) {
+				def oldName = m.group(1)
+				def newName = m.group(2)
+				if (oldName == 'taz.womp.Main' || oldName.endsWith('.Main')) mainClass = newName
+			}
+			if (!mainClass) {
+				def m2 = (logFile.text =~ /main[-_\s]*class\s*[:=]\s*['\"]?([a-zA-Z0-9_.$]+)/)
+				if (m2.find()) mainClass = m2.group(1)
+			}
+		}
+        if (!mainClass) {
+            throw new GradleException("Could not determine renamed main class from allatori-log.xml")
+        }
+        def obfJar = file("$buildDir/libs/womp-obfuscated.jar")
+        if (!obfJar.exists()) {
+            throw new GradleException("Obfuscated jar not found: ${obfJar.absolutePath}")
+        }
+        println("Updating fabric.mod.json entrypoint -> ${mainClass}")
+
+		def jsonFile = file("$buildDir/resources/main/fabric.mod.json")
+		if (jsonFile.exists()) {
+			def json = new JsonSlurper().parseText(jsonFile.text)
+			if (!json.entrypoints) json.entrypoints = [:]
+			json.entrypoints.main = [mainClass]
+			jsonFile.text = JsonOutput.prettyPrint(JsonOutput.toJson(json))
+			println("Updated fabric.mod.json entrypoints.main -> ${mainClass}")
+                } else {
+			println("fabric.mod.json not found at ${jsonFile.absolutePath}; will only update jar content")
+		}
+        def srcJar = new java.util.zip.ZipFile(obfJar)
+        def tempJar = file("$buildDir/libs/womp-obfuscated-updated.jar")
+        if (tempJar.exists()) tempJar.delete()
+        def jos = new ZipOutputStream(new FileOutputStream(tempJar))
+		try {
+			srcJar.entries().each { e ->
+				def newEntry = new ZipEntry(e.name)
+				newEntry.time = e.time
+				jos.putNextEntry(newEntry)
+				if (e.name == "fabric.mod.json" && jsonFile.exists()) {
+					jos.write(jsonFile.bytes)
+        } else {
+					jos.write(srcJar.getInputStream(e).bytes)
+				}
+				jos.closeEntry()
+			}
+		} finally {
+			jos.close()
+			srcJar.close()
+		}
+		obfJar.delete()
+		tempJar.renameTo(obfJar)
+        println("Patched fabric.mod.json in ${obfJar.name}")
+	}
+}
+
+tasks.register("allatoriObfuscate") {
+	group = "allatori"
+    description = "Builds input, copies deps, runs Allatori, and updates fabric.mod.json"
+    dependsOn tasks.named("updateFabricModJson")
+}
+
+tasks.named("remapJar") {
+	dependsOn tasks.named("updateFabricModJson")
+	input.set(file("$buildDir/libs/womp-obfuscated.jar"))
+	archiveClassifier.set("remapped")
+	doFirst {
+		def inFile = file("$buildDir/libs/womp-obfuscated.jar")
+		if (!inFile.exists()) {
+			throw new GradleException("Obfuscated jar not found for remapping: ${inFile.absolutePath}")
+		}
+		println("Remapping obfuscated jar: ${inFile.absolutePath} (${inFile.length()} bytes)")
+	}
+}
+
+tasks.build {
+	dependsOn tasks.named("allatoriObfuscate")
+	dependsOn tasks.named("remapJar")
+}
